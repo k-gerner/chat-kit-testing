@@ -58,6 +58,10 @@ class RelevancyCheck(BaseModel):
 
 guardrail_agent= Agent(
     name="Query Relevance Guard",
+    # instructions=(
+    #     "Determine if the query is relevant to Yext services, technology product questions, general technology troubleshooting, or the capabilities of the agent. "
+    #     "Return is_relevant=False if the query is not related to these topics."
+    # ),
     instructions=(
         "Determine if the query is relevant to customer support, technology product questions, general technology troubleshooting, or the capabilities of the agent. "
         "Return is_relevant=False if the query is not related to these topics."
@@ -80,6 +84,7 @@ async def relevancy_guard(ctx, agent, input_data):
 rag_agent = Agent(
     name="RAG assistant",
     instructions=(
+        "You are a Samsung help center support agent. You help customers with troubleshooting and product recommendations."
         "Only use information from the Knowledge Base. "
         "If no answer is found, say 'I don't know' or similar. "
         "In your response, do not mention the file store directly, just the references themselves. "
@@ -93,7 +98,8 @@ rag_agent = Agent(
             max_num_results=8,
         )
     ],
-    input_guardrails=[relevancy_guard]
+    input_guardrails=[relevancy_guard],
+    # model="gpt-5-nano"
 )
 
 LOG_FORMAT = "%(asctime)s %(message)s"
