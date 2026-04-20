@@ -24,6 +24,7 @@ from agents import (
     GuardrailFunctionOutput,
     input_guardrail,
     InputGuardrailTripwireTriggered,
+    ModelSettings,
     Runner
 )
 from openai import AsyncOpenAI
@@ -52,6 +53,7 @@ from chatkit.types import (
   ThreadItemDoneEvent,
   ThreadStreamEvent
 )
+from openai.types.shared import Reasoning
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -88,6 +90,7 @@ guardrail_agent= Agent(
 @input_guardrail(run_in_parallel=False) # ensures that it finishes before streaming starts
 async def relevancy_guard(ctx, agent, input_data):
     result = await Runner.run(guardrail_agent, input_data, context=ctx)
+    _log_token_usage("relevancy_guard", result)
     analysis: RelevancyCheck = result.final_output
     print(f"Relevancy check: is_relevant={analysis.is_relevant}, reasoning={analysis.reasoning}")
 
@@ -111,11 +114,17 @@ rag_agent = Agent(
     tools=[
         FileSearchTool(
             vector_store_ids=[VECTOR_STORE_ID],
-            max_num_results=8,
+            max_num_results=10,
+            include_search_results=True,
         )
     ],
     input_guardrails=[relevancy_guard],
-    # model="gpt-5-nano"
+    model="gpt-5-nano",
+    model_settings=ModelSettings(
+        reasoning=Reasoning(
+            effort="low"
+        )
+    )
 )
 
 LOG_FORMAT = "%(asctime)s %(message)s"
@@ -129,6 +138,68 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
+def _extract_request_id(context: Any) -> str | None:
+    current = context
+    for _ in range(4):
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            request_id = current.get("request_id")
+            return request_id if isinstance(request_id, str) else None
+
+        request_context = getattr(current, "request_context", None)
+        if isinstance(request_context, dict):
+            request_id = request_context.get("request_id")
+            if isinstance(request_id, str):
+                return request_id
+
+        nested_context = getattr(current, "context", None)
+        if nested_context is not None and nested_context is not current:
+            current = nested_context
+            continue
+        if request_context is not None and request_context is not current:
+            current = request_context
+            continue
+        break
+
+    return None
+
+
+def _log_token_usage(label: str, result: Any) -> None:
+    context_wrapper = getattr(result, "context_wrapper", None)
+    usage = getattr(context_wrapper, "usage", None)
+    request_id = _extract_request_id(getattr(context_wrapper, "context", None))
+    request_id_part = f" request_id={request_id}" if request_id else ""
+
+    if usage is None:
+        LOGGER.info("---- Token usage [%s]%s unavailable", label, request_id_part)
+        return
+
+    request_entries = list(getattr(usage, "request_usage_entries", []))
+    if request_entries:
+        for index, request_usage in enumerate(request_entries, start=1):
+            LOGGER.info(
+                "---- Token usage [%s call=%s/%s]%s input=%s output=%s total=%s",
+                label,
+                index,
+                len(request_entries),
+                request_id_part,
+                request_usage.input_tokens,
+                request_usage.output_tokens,
+                request_usage.total_tokens,
+            )
+
+    LOGGER.info(
+        "---- Token usage [%s total]%s input=%s output=%s total=%s requests=%s",
+        label,
+        request_id_part,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        usage.requests,
+    )
+
+
 class MetadataAwareResponseStreamConverter(ResponseStreamConverter):
     """Populate file citation titles from vector-store file attributes."""
 
@@ -136,45 +207,72 @@ class MetadataAwareResponseStreamConverter(ResponseStreamConverter):
         super().__init__()
         self.client = client
         self.vector_store_id = vector_store_id
-        self._file_metadata_cache: dict[str, tuple[str, str | None, str | None]] = {}
+        self._file_metadata_cache: dict[
+            str, tuple[str | None, str | None, str | None]
+        ] = {}
+
+    def _metadata_from_attributes(
+        self, attributes: dict[str, Any] | None
+    ) -> tuple[str | None, str | None, str | None]:
+        attributes = attributes or {}
+
+        title = None
+        subtitle = None
+        link = None
+
+        name = attributes.get("name")
+        if isinstance(name, str) and name.strip():
+            title = name.strip()
+
+        price = attributes.get("price")
+        if isinstance(price, str) and price.strip():
+            subtitle = price.strip()
+        elif isinstance(price, (int, float, bool)):
+            subtitle = str(price)
+
+        raw_link = attributes.get("link")
+        if isinstance(raw_link, str) and raw_link.strip():
+            link = raw_link.strip()
+
+        return title, subtitle, link
+
+    def cache_file_search_results(self, results: list[Any] | None) -> None:
+        if not results:
+            return
+
+        for result in results:
+            file_id = getattr(result, "file_id", None)
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            self._file_metadata_cache[file_id] = self._metadata_from_attributes(
+                getattr(result, "attributes", None)
+            )
 
     async def _get_file_metadata(
         self, file_id: str, fallback_filename: str
     ) -> tuple[str, str | None, str | None]:
         cached_metadata = self._file_metadata_cache.get(file_id)
         if cached_metadata is not None:
-            return cached_metadata
+            title, subtitle, link = cached_metadata
+            return title or fallback_filename, subtitle, link
 
-        title = fallback_filename
-        subtitle = None
-        link = None
         try:
             vector_store_file = await self.client.vector_stores.files.retrieve(
                 file_id=file_id,
                 vector_store_id=self.vector_store_id,
             )
-            attributes = vector_store_file.attributes or {}
-            name = attributes.get("name")
-            if isinstance(name, str) and name.strip():
-                title = name.strip()
-            price = attributes.get("price")
-            if isinstance(price, str) and price.strip():
-                subtitle = price.strip()
-            elif isinstance(price, (int, float, bool)):
-                subtitle = str(price)
-            raw_link = attributes.get("link")
-            if isinstance(raw_link, str) and raw_link.strip():
-                link = raw_link.strip()
+            metadata = self._metadata_from_attributes(vector_store_file.attributes)
         except Exception:
             LOGGER.warning(
                 "Failed to load vector store metadata for citation file %s",
                 file_id,
                 exc_info=True,
             )
+            metadata = (None, None, None)
 
-        metadata = (title, subtitle, link)
         self._file_metadata_cache[file_id] = metadata
-        return metadata
+        title, subtitle, link = metadata
+        return title or fallback_filename, subtitle, link
 
     async def file_citation_to_annotation(
         self, file_citation: AnnotationFileCitation
@@ -240,6 +338,33 @@ response_stream_converter = MetadataAwareResponseStreamConverter(
 )
 
 
+class MetadataCachingRunResult:
+    """Intercept file search tool results so citation metadata can be cached."""
+
+    def __init__(
+        self,
+        result: Any,
+        converter: MetadataAwareResponseStreamConverter,
+    ):
+        self._result = result
+        self._converter = converter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._result, name)
+
+    async def stream_events(self) -> AsyncIterator[Any]:
+        async for event in self._result.stream_events():
+            if event.type == "raw_response_event":
+                raw_event = event.data
+                if raw_event.type == "response.output_item.done":
+                    item = raw_event.item
+                    if getattr(item, "type", None) == "file_search_call":
+                        self._converter.cache_file_search_results(
+                            getattr(item, "results", None)
+                        )
+            yield event
+
+
 class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
     """ChatKit server implementation."""
 
@@ -273,15 +398,20 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
 
         try:
             result = Runner.run_streamed(rag_agent, agent_input, context=agent_ctx)
+            metadata_caching_result = MetadataCachingRunResult(
+                result,
+                response_stream_converter,
+            )
 
             # IMPORTANT: this converts Responses/Agents streaming events -> ChatKit ThreadStreamEvents
             # and auto-attaches file/url citations as ChatKit annotations (Sources in UI).
             async for ev in stream_agent_response(
                 agent_ctx,
-                result,
+                metadata_caching_result,
                 converter=response_stream_converter,
             ):
                 yield ev
+            _log_token_usage("rag_agent", result)
         except InputGuardrailTripwireTriggered as exc:
             output_info = exc.guardrail_result.output.output_info
             # message_text = (
@@ -326,8 +456,10 @@ chatkit_server = DemoChatKitServer(data_store)
 @app.post("/chatkit")
 async def chatkit_endpoint(request: Request):
     body = await request.body()
-    context = {}
+    request_id = str(uuid.uuid4())
+    context = {"request_id": request_id}
 
+    LOGGER.info("Processing /chatkit request_id=%s", request_id)
     print("threads: ", chatkit_server.store.threads)
     result = await chatkit_server.process(body, context)
 
