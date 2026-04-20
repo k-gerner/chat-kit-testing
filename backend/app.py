@@ -26,10 +26,22 @@ from agents import (
     InputGuardrailTripwireTriggered,
     Runner
 )
+from openai import AsyncOpenAI
+from openai.types.responses.response_output_text import (
+    AnnotationContainerFileCitation,
+    AnnotationFileCitation,
+)
 from pydantic import BaseModel
-from chatkit.agents import AgentContext, simple_to_agent_input, stream_agent_response
+from chatkit.agents import (
+    AgentContext,
+    ResponseStreamConverter,
+    simple_to_agent_input,
+    stream_agent_response,
+)
 from chatkit.server import ChatKitServer, StreamingResult
 from chatkit.types import (
+  Annotation,
+  FileSource,
   ThreadMetadata,
   ThreadStreamEvent,
   UserMessageItem,
@@ -117,6 +129,117 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
+class MetadataAwareResponseStreamConverter(ResponseStreamConverter):
+    """Populate file citation titles from vector-store file attributes."""
+
+    def __init__(self, client: AsyncOpenAI, vector_store_id: str):
+        super().__init__()
+        self.client = client
+        self.vector_store_id = vector_store_id
+        self._file_metadata_cache: dict[str, tuple[str, str | None, str | None]] = {}
+
+    async def _get_file_metadata(
+        self, file_id: str, fallback_filename: str
+    ) -> tuple[str, str | None, str | None]:
+        cached_metadata = self._file_metadata_cache.get(file_id)
+        if cached_metadata is not None:
+            return cached_metadata
+
+        title = fallback_filename
+        subtitle = None
+        link = None
+        try:
+            vector_store_file = await self.client.vector_stores.files.retrieve(
+                file_id=file_id,
+                vector_store_id=self.vector_store_id,
+            )
+            attributes = vector_store_file.attributes or {}
+            name = attributes.get("name")
+            if isinstance(name, str) and name.strip():
+                title = name.strip()
+            price = attributes.get("price")
+            if isinstance(price, str) and price.strip():
+                subtitle = price.strip()
+            elif isinstance(price, (int, float, bool)):
+                subtitle = str(price)
+            raw_link = attributes.get("link")
+            if isinstance(raw_link, str) and raw_link.strip():
+                link = raw_link.strip()
+        except Exception:
+            LOGGER.warning(
+                "Failed to load vector store metadata for citation file %s",
+                file_id,
+                exc_info=True,
+            )
+
+        metadata = (title, subtitle, link)
+        self._file_metadata_cache[file_id] = metadata
+        return metadata
+
+    async def file_citation_to_annotation(
+        self, file_citation: AnnotationFileCitation
+    ) -> Annotation | None:
+        filename = file_citation.filename
+        if not filename:
+            return None
+
+        title = filename
+        subtitle = None
+        link = None
+        if file_citation.file_id:
+            title, subtitle, link = await self._get_file_metadata(
+                file_citation.file_id,
+                filename,
+            )
+
+        return Annotation(
+            source=FileSource(
+                filename=filename,
+                title=title,
+                description=subtitle,
+                group=link,
+            ),
+            index=file_citation.index,
+        )
+
+    async def container_file_citation_to_annotation(
+        self, container_file_citation: AnnotationContainerFileCitation
+    ) -> Annotation | None:
+        filename = container_file_citation.filename
+        if not filename:
+            return None
+
+        title = filename
+        subtitle = None
+        link = None
+        if container_file_citation.file_id:
+            title, subtitle, link = await self._get_file_metadata(
+                container_file_citation.file_id,
+                filename,
+            )
+
+        return Annotation(
+            source=FileSource(
+                filename=filename,
+                title=title,
+                description=subtitle,
+                group=link,
+            ),
+            index=container_file_citation.end_index,
+        )
+
+
+openai_client = (
+    AsyncOpenAI(project=OPENAI_PROJECT_ID)
+    if OPENAI_PROJECT_ID
+    else AsyncOpenAI()
+)
+response_stream_converter = MetadataAwareResponseStreamConverter(
+    client=openai_client,
+    vector_store_id=VECTOR_STORE_ID,
+)
+
+
 class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
     """ChatKit server implementation."""
 
@@ -153,7 +276,11 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
 
             # IMPORTANT: this converts Responses/Agents streaming events -> ChatKit ThreadStreamEvents
             # and auto-attaches file/url citations as ChatKit annotations (Sources in UI).
-            async for ev in stream_agent_response(agent_ctx, result):
+            async for ev in stream_agent_response(
+                agent_ctx,
+                result,
+                converter=response_stream_converter,
+            ):
                 yield ev
         except InputGuardrailTripwireTriggered as exc:
             output_info = exc.guardrail_result.output.output_info

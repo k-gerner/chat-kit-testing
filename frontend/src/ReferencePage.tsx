@@ -1,13 +1,18 @@
 import { useMemo } from "react";
 
 type ReferencePageProps = {
-  filename: string;
+  title: string;
+  filename?: string;
 };
 
-export default function ReferencePage({ filename }: ReferencePageProps) {
-  const safeFilename = useMemo(() => {
-    const trimmed = filename.trim();
+export default function ReferencePage({ title, filename }: ReferencePageProps) {
+  const safeTitle = useMemo(() => {
+    const trimmed = title.trim();
     return trimmed.length > 0 ? trimmed : "unknown";
+  }, [title]);
+  const safeFilename = useMemo(() => {
+    const trimmed = filename?.trim();
+    return trimmed ? trimmed : null;
   }, [filename]);
 
   return (
@@ -18,11 +23,16 @@ export default function ReferencePage({ filename }: ReferencePageProps) {
             Reference
           </div>
           <h1 className="mt-3 text-2xl font-semibold text-slate-900">
-            This is a page for <span className="text-slate-700">{safeFilename}</span>!
+            This is a page for <span className="text-slate-700">{safeTitle}</span>!
           </h1>
           <p className="mt-3 text-sm text-slate-500">
             Your content could go here.
           </p>
+          {safeFilename && (
+            <p className="mt-2 text-xs uppercase tracking-[0.2em] text-slate-400">
+              File: {safeFilename}
+            </p>
+          )}
         </div>
       </div>
     </div>

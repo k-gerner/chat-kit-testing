@@ -9,12 +9,43 @@ type ReferenceSource = {
   key: string;
   title: string;
   subtitle?: string;
+  filename?: string;
+  link?: string;
   kind: "url" | "file" | "entity" | "unknown";
 };
 
-function openReferencePage(filename: string) {
-  const safeFilename = filename.trim() || "unknown";
-  const url = `/#reference?filename=${encodeURIComponent(safeFilename)}`;
+function getNavigableUrl(rawUrl?: string) {
+  if (!rawUrl) {
+    return null;
+  }
+
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return url.toString();
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function openReferencePage(source: ReferenceSource) {
+  const destination = getNavigableUrl(source.link);
+  if (destination) {
+    window.open(destination, "_blank", "noopener,noreferrer");
+    return;
+  }
+
+  const safeTitle = source.title.trim() || "unknown";
+  const params = new URLSearchParams({ title: safeTitle });
+
+  if (source.kind === "file" && source.filename) {
+    params.set("filename", source.filename);
+  }
+
+  const url = `/#reference?${params.toString()}`;
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
@@ -63,7 +94,6 @@ function ReferencesWidgetPanel({
           {!isLoadingReferences && referenceSources.length > 0 && (
             <div className="flex flex-col gap-2">
               {referenceSources.map((source) => {
-                const filename = source.kind === "file" && source.subtitle ? source.subtitle : source.title;
                 const cardClasses = [
                   "flex items-center justify-between gap-3 rounded-xl px-3 py-2",
                   "transition-colors",
@@ -101,7 +131,7 @@ function ReferencesWidgetPanel({
                     </div>
                     <button
                       type="button"
-                      onClick={() => openReferencePage(filename)}
+                      onClick={() => openReferencePage(source)}
                       className={visitClasses}
                       style={{ backgroundColor: accentColor }}
                     >
@@ -294,18 +324,25 @@ export default function App() {
       for (const source of rawSources) {
         const kind = source?.type ?? "unknown";
         const title = source?.title ?? "Untitled reference";
+        const filename = kind === "file" ? source?.filename : undefined;
+        const link =
+          kind === "file"
+            ? source?.group
+            : kind === "url"
+              ? source?.url
+              : undefined;
         const subtitle =
           kind === "url"
             ? source?.url
             : kind === "file"
-              ? source?.filename ?? source?.description
+              ? source?.description ?? source?.filename
               : kind === "entity"
                 ? source?.label ?? source?.id
                 : source?.description;
-        const key = `${kind}|${title}|${subtitle ?? ""}`;
+        const key = `${kind}|${title}|${subtitle ?? ""}|${filename ?? ""}|${link ?? ""}`;
 
         if (!unique.has(key)) {
-          unique.set(key, { key, title, subtitle, kind });
+          unique.set(key, { key, title, subtitle, filename, link, kind });
         }
       }
 
