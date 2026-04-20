@@ -9,6 +9,7 @@ import os
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime
+from pathlib import Path
 import random
 import sys
 import uuid
@@ -47,10 +48,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from simple_store import SimpleStore
 
 # Load environment variables
-load_dotenv()
+BACKEND_DIR = Path(__file__).resolve().parent
+load_dotenv(BACKEND_DIR / ".env", override=True)
+
+OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")
 
 # VECTOR_STORE_ID = "vs_68c3406b54148191b1bccebbc53ee263" # Hitchhikers
-VECTOR_STORE_ID = "vs_696fe274d4e48191a041e24ea386b0bb" # Samsung
+VECTOR_STORE_ID = "vs_69e2a4dd47e881919bb0afe1ea9eaa6b" # Samsung
 
 class RelevancyCheck(BaseModel):
     is_relevant: bool
@@ -310,6 +314,7 @@ if __name__ == "__main__":
     print(f"📍 Server: http://localhost:{port}")
     print(f"📡 ChatKit endpoint: http://localhost:{port}/chatkit")
     print(f"🔑 API Key configured: {bool(os.getenv('OPENAI_API_KEY'))}")
+    print(f"📁 OpenAI project: {OPENAI_PROJECT_ID or '(default)'}")
     print("=" * 60)
     
     uvicorn.run(app, host="0.0.0.0", port=port)
